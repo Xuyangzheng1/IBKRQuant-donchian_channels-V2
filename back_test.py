@@ -17,12 +17,12 @@ class TestDonchianStrategy(unittest.TestCase):
         
         # 初始化策略
         self.strategy = ImprovedDonchianStrategy(
-           symbol='AAPL',           # 交易标的
-           capital=1000,          # 初始资金
+           symbol='TSLA',           # 交易标的
+           capital=100000,          # 初始资金
            period=20,               # 通道周期
            base_tranches=3,         # 分批数
            alert_threshold=0.004,   # 触发阈值
-           max_capital_per_trade=1000  # 最大交易额
+           max_capital_per_trade=50000  # 最大交易额
        )
         
         # 替换策略中的TWS对象
