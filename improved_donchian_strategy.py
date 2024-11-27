@@ -558,6 +558,14 @@ class ImprovedDonchianStrategy:
                         entry_price = price
                         available_capital -= (trade_size * price)  # 更新可用资金
                         total_trades += 1
+                        trade = Trade("BUY", price, trade_size, timestamp, lower)
+
+                        current_data = {
+                            'current_price': price,
+                            'upper_channel': upper,
+                            'lower_channel': lower
+                        }
+                        self.save_trade_to_csv(trade, current_data)  # 保存到CSV
                         
                         trade_records.append({
                             'time': timestamp,
@@ -586,7 +594,15 @@ class ImprovedDonchianStrategy:
                     
                     if pnl > 0:
                         winning_trades += 1
-                        
+                    
+                    trade = Trade("SELL", price, trade_size, timestamp, upper)
+                    current_data = {
+                        'current_price': price,
+                        'upper_channel': upper,
+                        'lower_channel': lower
+                    }
+                    self.save_trade_to_csv(trade, current_data)
+
                     trade_records.append({
                         'time': timestamp,
                         'action': 'SELL',
