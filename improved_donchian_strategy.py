@@ -1,5 +1,6 @@
 
 from decimal import Decimal
+import random
 import yfinance as yf
 from ibapi.client import EClient
 from ibapi.wrapper import EWrapper
@@ -33,18 +34,75 @@ class TradingBot(EWrapper, EClient):
         self.positions = {}
         self.current_price = None
         self.order_id = 0
+        self.connected = False
         self.position_received = False
+        self.pnl_single_received = False  # 新增
         self.logger = logging.getLogger(__name__)
+        self.stock_pnls = {}  # 新增
+        self.account = None
         
     def error(self, reqId, errorCode, errorString):
         logging.error(f'Error {errorCode}: {errorString}')
-        
+        if errorCode == 102:  # 复制产品代码错误
+            if reqId in self.pnl_request_map:
+                symbol = self.pnl_request_map[reqId]
+                self.logger.error(f"获取{symbol}的PnL信息失败，可能需要订阅市场数据")
+        elif errorCode == 502:
+            self.connected = False
+            
     def nextValidId(self, orderId):
         self.order_id = orderId
         self._connected = True  # 使用新的变量名
         logging.info("Connected to TWS")
         self.reqPositions()
-        
+    def pnlSingle(self, reqId: int, pos: int, dailyPnL: float, unrealizedPnL: float, realizedPnL: float, value: float):
+        """接收单个股票的盈亏回调"""
+        if reqId in self.pnl_request_map:
+            symbol = self.pnl_request_map[reqId]
+            self.stock_pnls[symbol] = {
+                'position': pos,
+                'daily_pnl': dailyPnL,
+                'unrealized_pnl': unrealizedPnL,
+                'realized_pnl': realizedPnL,
+                'value': value
+            }
+            self.pnl_single_received = True
+            
+            self.logger.info(f"{symbol} PnL更新")
+            self.logger.info(f"当日盈亏: ${dailyPnL:.2f}")
+            self.logger.info(f"未实现盈亏: ${unrealizedPnL:.2f}")
+            self.logger.info(f"已实现盈亏: ${realizedPnL:.2f}")
+
+    def reqStockPnL(self, symbol: str):
+        """请求特定股票的PnL"""
+        try:
+            if symbol in self.positions and self.account:
+                contract = self.positions[symbol]['contract']
+                if not contract.conId:
+                    self.logger.error(f"无法获取{symbol}的合约ID")
+                    return
+                    
+                # 先订阅市场数据
+                self.reqMktData(self.order_id, contract, "", False, False, [])
+                time.sleep(0.5)  # 等待市场数据
+                    
+                req_id = self.order_id + 1
+                self.pnl_request_map[req_id] = symbol
+                
+                # 请求特定股票的PnL
+                self.reqPnLSingle(req_id, self.account, "", contract.conId)
+                
+        except Exception as e:
+            self.logger.error(f"请求股票PnL时出错: {str(e)}")
+            
+    def getStockPnL(self, symbol: str):
+        """获取特定股票的盈亏信息"""
+        return self.stock_pnls.get(symbol, {
+            'daily_pnl': 0,
+            'unrealized_pnl': 0,
+            'realized_pnl': 0,
+            'value': 0
+        })   
     def position(self, account: str, contract: Contract, pos: Decimal, avgCost: float):
         """接收持仓回调"""
         symbol = contract.symbol
@@ -54,12 +112,36 @@ class TradingBot(EWrapper, EClient):
             'position': float(pos),
             'avg_cost': float(avgCost),
             'account': account,
+            'contract': contract,  # 新增：保存合约信息
             'last_update': datetime.now()
         }
+        
+        if account:
+            self.account = account
     def positionEnd(self):
         """持仓数据接收完成"""
         self.position_received = True
         self.logger.info("Position data end")
+        self.pnl_request_map = {}  # 新增
+    def pnl(self, reqId: int, dailyPnL: float, unrealizedPnL: float, realizedPnL: float):
+        """接收盈亏回调"""
+        self.daily_pnl = dailyPnL
+        self.unrealized_pnl = unrealizedPnL
+        self.realized_pnl = realizedPnL
+        self.pnl_received = True
+        
+        self.logger.info(f"PnL更新")
+        self.logger.info(f"当日盈亏: ${dailyPnL:.2f}")
+        self.logger.info(f"未实现盈亏: ${unrealizedPnL:.2f}")
+        self.logger.info(f"已实现盈亏: ${realizedPnL:.2f}")
+        
+    def getPnL(self):
+        """获取最新的盈亏信息"""
+        return {
+            'daily_pnl': self.daily_pnl,
+            'unrealized_pnl': self.unrealized_pnl,
+            'realized_pnl': self.realized_pnl
+        }        
     def isConnected(self):  # 添加方法来检查连接状态
         """返回连接状态"""
         return self.isConnected   
@@ -198,13 +280,30 @@ class Position:
         """重置每日交易记录"""
         self.trades_today = []
         
-    def verify_position(self, ib_quantity, ib_avg_cost):
-        """验证并纠正持仓信息"""
-        if self.quantity != ib_quantity:
-            self.logger.warning(f"持仓不一致 - 本地: {self.quantity}, IB: {ib_quantity}")
-            self.update_from_ib(ib_quantity, ib_avg_cost)
-            return True
-        return False
+    def verify_position(self):
+        """验证当前仓位信息"""
+        try:
+            # 等待直到收到持仓数据
+            wait_count = 0
+            while not self.bot.position_received and wait_count < 10:
+                time.sleep(0.5)
+                wait_count += 1
+                
+            position_info = self.bot.positions.get(self.symbol, {})
+            if position_info:
+                ib_position = position_info.get('position', 0)
+                avg_cost = position_info.get('avg_cost', 0)
+                
+                if ib_position != self.current_position_size:
+                    self.logger.warning(f"仓位不一致! IB仓位: {ib_position}, 本地记录: {self.current_position_size}")
+                    self.current_position_size = ib_position
+                    self.total_cost_basis = ib_position * avg_cost
+                    
+            return self.current_position_size
+            
+        except Exception as e:
+            self.logger.error(f"验证仓位错误: {str(e)}")
+            return 0
         
     def get_position_info(self):
         """获取当前持仓信息"""
@@ -378,11 +477,30 @@ class ImprovedDonchianStrategy:
     def update_position_info(self, action, filled_quantity, price):
         """更新持仓信息"""
         try:
-            self.position_manager.record_trade(self.symbol, action, filled_quantity, price)
-            position = self.position_manager.get_position(self.symbol)
-            self.current_position_size = position.quantity
-            self.total_cost_basis = position.total_cost
-            self.realized_pnl = position.realized_pnl
+            old_position = self.current_position_size
+            old_cost_basis = self.total_cost_basis
+            
+            if action == "BUY":
+                self.current_position_size += filled_quantity
+                self.total_cost_basis += (filled_quantity * price)
+            else:  # SELL
+                if old_position > 0:
+                    # 计算已实现盈亏
+                    avg_cost = old_cost_basis / old_position
+                    realized_pnl = filled_quantity * (price - avg_cost)
+                    self.realized_pnl += realized_pnl
+                    self.logger.info(f"交易实现盈亏: ${realized_pnl:.2f}")
+                    
+                self.current_position_size -= filled_quantity
+                if self.current_position_size > 0:
+                    self.total_cost_basis = (old_cost_basis / old_position) * self.current_position_size
+                else:
+                    self.total_cost_basis = 0
+                    
+            self.logger.info(f"持仓更新 - 数量: {self.current_position_size}, 总成本: ${self.total_cost_basis:.2f}")
+            if self.current_position_size > 0:
+                avg_cost = self.total_cost_basis / self.current_position_size
+                self.logger.info(f"新平均成本: ${avg_cost:.2f}")
             
         except Exception as e:
             self.logger.error(f"更新持仓信息错误: {str(e)}")
@@ -930,23 +1048,49 @@ class ImprovedDonchianStrategy:
             self.logger.info(f"交易品种: {self.symbol}")
             self.logger.info(f"初始资金: ${self.capital:,}")
             
-            # 连接交易接口
-            self.bot.connect("127.0.0.1", 7497, 1)
+            # 连接到TWS
+            self.bot.connect("127.0.0.1", 7497, clientId=random.randint(1, 10000))
             
+            # 创建并启动API线程
             api_thread = threading.Thread(target=lambda: self.bot.run(), daemon=True)
             api_thread.start()
-            time.sleep(1)  # 等待连接建立
+            time.sleep(1)
             
-            # 请求持仓数据
+            # 更新持仓信息
             self.logger.info("请求持仓数据...")
             self.bot.reqPositions()
-            time.sleep(1)  # 等待数据返回
             
-            # 获取持仓信息
+            # 等待持仓数据
+            wait_count = 0
+            while not self.bot.position_received and wait_count < 10:
+                time.sleep(1)
+                wait_count += 1
+                self.logger.info(f"等待数据... {wait_count}/10")
+            
+            # 更新持仓信息
             position_info = self.bot.positions.get(self.symbol, {})
-            self.current_position_size = position_info.get('position', 0)
-            self.logger.info(f"当前持仓: {self.current_position_size}")
+            if position_info:
+                self.current_position_size = position_info.get('position', 0)
+                avg_cost = position_info.get('avg_cost', 0)
+                self.total_cost_basis = self.current_position_size * avg_cost
+                self.logger.info(f"当前持仓: {self.current_position_size}")
+                self.logger.info(f"平均成本: ${avg_cost:.2f}")
+                self.logger.info(f"总成本: ${self.total_cost_basis:.2f}")
+                
+                # 请求并获取特定股票的盈亏信息
+                if self.bot.account:
+                    self.bot.reqStockPnL(self.symbol)
+                    time.sleep(1)  # 等待数据返回
+                    pnl_info = self.bot.getStockPnL(self.symbol)
+                    self.logger.info(f"当日盈亏: ${pnl_info['daily_pnl']:.2f}")
+                    self.logger.info(f"未实现盈亏: ${pnl_info['unrealized_pnl']:.2f}")
+                    self.logger.info(f"已实现盈亏: ${pnl_info['realized_pnl']:.2f}")
+            else:
+                self.current_position_size = 0
+                self.total_cost_basis = 0
+                self.logger.info("无持仓")
             
+            # 主循环
             while True:
                 try:
                     now = datetime.now()
@@ -960,46 +1104,47 @@ class ImprovedDonchianStrategy:
                     
                     # 获取市场数据
                     df = self.get_market_data()
-                    df = self.get_donchian_channels(df)
-                    latest = df.iloc[-1]
-                    
-                    current_price = latest['Close']
-                    upper_channel = latest['upper_channel']
-                    lower_channel = latest['lower_channel']
-                    
-                    # 传入完整df用于计算基准宽度
-                    channel_position = self.is_near_channel(
-                        current_price,
-                        upper_channel,
-                        lower_channel,
-                        df
-                    )
-                    
-                    # 记录状态
-                    self.log_status(current_price, upper_channel, lower_channel)
-                    
-                    # 交易逻辑
-                    if channel_position == "UPPER" and self.current_position_size > 0:
-                        # 触及上轨，平仓
-                        self.logger.info("\n检测到上轨突破信号 - 准备卖出")
-                        if self.execute_trade("SELL", current_price, upper_channel, lower_channel):
-                            self.position = 0
-                    
-                    elif channel_position == "LOWER":
-                        # 触及下轨，考虑开仓或加仓
-                        self.logger.info("\n检测到下轨支撑信号 - 准备买入")
-                        if self.execute_trade("BUY", current_price, upper_channel, lower_channel):
-                            self.position = 1
-                    
-                    # 收盘检查
-                    if now.hour == 16 and now.minute == 0:
-                        self.handle_market_close(current_price, upper_channel, lower_channel)
+                    if df is not None and not df.empty:
+                        df = self.get_donchian_channels(df)
+                        latest = df.iloc[-1]
+                        
+                        current_price = latest['Close']
+                        upper_channel = latest['upper_channel']
+                        lower_channel = latest['lower_channel']
+                        
+                        # 传入完整df用于计算基准宽度
+                        channel_position = self.is_near_channel(
+                            current_price,
+                            upper_channel,
+                            lower_channel,
+                            df
+                        )
+                        
+                        # 记录状态
+                        self.log_status(current_price, upper_channel, lower_channel)
+                        
+                        # 交易逻辑
+                        if channel_position == "UPPER" and self.current_position_size > 0:
+                            # 触及上轨，平仓
+                            self.logger.info("\n检测到上轨突破信号 - 准备卖出")
+                            if self.execute_trade("SELL", current_price, upper_channel, lower_channel):
+                                self.position = 0
+                        
+                        elif channel_position == "LOWER" and self.current_position_size == 0:
+                            # 触及下轨，考虑开仓或加仓
+                            self.logger.info("\n检测到下轨支撑信号 - 准备买入")
+                            if self.execute_trade("BUY", current_price, upper_channel, lower_channel):
+                                self.position = 1
+                        
+                        # 更新特定股票的PnL
+                        if self.bot.account:
+                            self.bot.reqStockPnL(self.symbol)
+                            
+                        # 收盘检查
+                        if now.hour == 16 and now.minute == 0:
+                            self.handle_market_close(current_price, upper_channel, lower_channel)
                     
                     time.sleep(5)
-                    
-                except KeyboardInterrupt:
-                    self.logger.info("\n策略手动停止")
-                    break
                     
                 except Exception as e:
                     self.logger.error(f"策略运行错误: {str(e)}")
@@ -1007,7 +1152,7 @@ class ImprovedDonchianStrategy:
                     continue
                     
         except Exception as e:
-            self.logger.error(f"严重错误: {str(e)}")
+            self.logger.error(f"策略执行出错: {str(e)}")
         finally:
             if hasattr(self, 'bot'):
                 self.bot.disconnect()
@@ -1021,11 +1166,11 @@ class ImprovedDonchianStrategy:
         self.logger.info(f"持仓数量: {self.current_position_size}")
         
         if self.current_position_size > 0:
-            avg_cost = self.total_cost_basis / self.current_position_size
-            unrealized_pnl = self.current_position_size * (current_price - avg_cost)
-            self.logger.info(f"平均成本: ${avg_cost:.2f}")
-            self.logger.info(f"未实现盈亏: ${unrealized_pnl:.2f}")
-        self.logger.info(f"已实现盈亏: ${self.realized_pnl:.2f}")
+            # 使用 getStockPnL 替代 getPnL
+            pnl_info = self.bot.getStockPnL(self.symbol)
+            self.logger.info(f"当日盈亏: ${pnl_info['daily_pnl']:.2f}")
+            self.logger.info(f"未实现盈亏: ${pnl_info['unrealized_pnl']:.2f}")
+            self.logger.info(f"已实现盈亏: ${pnl_info['realized_pnl']:.2f}")
 
     def handle_market_close(self, current_price, upper_channel, lower_channel):
         """处理收盘时的逻辑"""

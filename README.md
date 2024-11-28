@@ -15,6 +15,20 @@ INFO:DonchianStrategy_TSLA:总交易次数: 34
 INFO:DonchianStrategy_TSLA:盈利交易: 25
 INFO:DonchianStrategy_TSLA:胜率: 73.53%
 
+2024/11/28
+添加了和ibkr交互信息
+2024-11-28 14:54:22,830 - DonchianStrategy_TSLA - INFO - 当前价格: $332.79
+2024-11-28 14:54:22,830 - DonchianStrategy_TSLA - INFO - 上轨: $333.50
+2024-11-28 14:54:22,830 - DonchianStrategy_TSLA - INFO - 下轨: $332.08
+2024-11-28 14:54:22,830 - DonchianStrategy_TSLA - INFO - 持仓数量: 1049.0
+2024-11-28 14:54:22,830 - DonchianStrategy_TSLA - INFO - 当日盈亏: $2248.21
+2024-11-28 14:54:22,830 - DonchianStrategy_TSLA - INFO - 未实现盈亏: $2024.98
+2024-11-28 14:54:22,830 - DonchianStrategy_TSLA - INFO - 已实现盈亏: $214.97
+
+待更新：1.唐奇安连续下跌时建议多批少量买入。
+2.终端输出格式化
+3.增加macd指标辅助
+
 
 
 # IBKRQuant-donchian_channels-V2
