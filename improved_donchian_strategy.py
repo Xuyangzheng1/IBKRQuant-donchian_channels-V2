@@ -18,6 +18,7 @@ from datetime import datetime
 import time
 #通道越窄，阈值越高还是越低？
 #操作后是否有间隔？（测试环境中不检查间隔）
+
 #应对连续下跌情况
 #持仓显示
 class Trade:
@@ -852,16 +853,14 @@ class ImprovedDonchianStrategy:
     
     # 在 ImprovedDonchianStrategy 类中添加
     # 在 ImprovedDonchianStrategy 类中
-
     def backtest(self, start_date=None, end_date=None, initial_position=0):
         try:
-            # 使用策略初始化时的参数
+            # [原有的初始化和数据获取代码保持不变，直到信号记录部分]...
             symbol = self.symbol            
             test_capital = self.capital     
             test_period = self.period       
             max_trade = self.max_capital_per_trade  
             
-            # 获取数据
             stock = yf.Ticker(symbol)
             if start_date and end_date:
                 hist = stock.history(start=start_date, end=end_date, interval='1m')
@@ -871,8 +870,7 @@ class ImprovedDonchianStrategy:
             if hist.empty:
                 self.logger.error("未能获取历史数据")
                 return None
-                
-            # 计算通道和基准宽度    
+                    
             hist['upper_channel'] = hist['High'].rolling(window=test_period).max()
             hist['lower_channel'] = hist['Low'].rolling(window=test_period).min()
             baseline_width = self.calculate_baseline_channel_width(hist)
@@ -886,17 +884,15 @@ class ImprovedDonchianStrategy:
             self.logger.info(f"单次最大交易额: ${max_trade}")
             self.logger.info(f"基准通道宽度: {baseline_width*100:.2f}%")
 
-            # 初始化回测数据
             available_capital = test_capital
             total_trades = 0
             winning_trades = 0
             total_pnl = 0
-            position = initial_position
+            position_size = initial_position
             entry_price = 0
-            trade_size = 0
             trade_records = []
+            all_signals = []
             
-            # 遍历数据
             for i in range(len(hist)):
                 row = hist.iloc[i]
                 price = row['Close']
@@ -904,120 +900,150 @@ class ImprovedDonchianStrategy:
                 lower = row['lower_channel']
                 timestamp = hist.index[i]
                 
-                # 检查是否触及通道
+                current_width = (upper - lower) / price
+                upper_dist = abs(price - upper) / upper * 100
+                lower_dist = abs(price - lower) / lower * 100
+                width_ratio = current_width / baseline_width
+
+                if width_ratio < 0.8:
+                    channel_state = "窄通道"
+                    adjusted_threshold = self.alert_threshold * 1.2
+                elif width_ratio > 1.2:
+                    channel_state = "宽通道"
+                    adjusted_threshold = self.alert_threshold * 0.8
+                else:
+                    channel_state = "正常通道"
+                    adjusted_threshold = self.alert_threshold
+
                 lookback_data = hist.iloc[max(0, i-test_period):i+1]
                 channel_position = self.is_near_channel(price, upper, lower, lookback_data)
                 
-                if channel_position == "LOWER" and position == 0:
-                    # 计算买入数量
-                    max_shares = min(
-                        int(available_capital / price),
-                        int(max_trade / price)
-                    )
-                    trade_size = max_shares
-                    
-                    if trade_size > 0:
-                        # 更新持仓
-                        position = 1
-                        entry_price = price
-                        available_capital -= (trade_size * price)
-                        total_trades += 1
-                        
-                        # 记录交易
-                        trade = Trade("BUY", price, trade_size, timestamp, lower)
-                        current_data = {
-                            'current_price': price,
-                            'upper_channel': upper,
-                            'lower_channel': lower
-                        }
-                        self.save_trade_to_csv(trade, current_data)
-                        
-                        # 获取其他指标
-                        upper_dist = abs(price - upper) / upper
-                        lower_dist = abs(price - lower) / lower
-                        adjusted_threshold = self.adjust_threshold(
-                            (upper-lower)/price, baseline_width)
-                        
-                        trade_records.append({
-                            'time': timestamp,
-                            'action': 'BUY',
-                            'price': price,
-                            'size': trade_size,
-                            'upper_price': upper,
-                            'lower_price': lower,
-                            'upper_dist': upper_dist * 100,
-                            'lower_dist': lower_dist * 100,
-                            'available_capital': available_capital,
-                            'reason': f'价格(${price:.2f})接近下轨(${lower:.2f})',
-                            'channel_width': f'{(upper-lower)/price*100:.2f}%',
-                            'baseline_width': baseline_width * 100,
-                            'adjusted_threshold': adjusted_threshold * 100,
-                            'can_trade': self.can_trade()
-                        })
-                        
-                        self.logger.info(
-                            f"买入 - 时间: {timestamp}, "
-                            f"数量: {trade_size}股, "
-                            f"价格: ${price:.2f}, "
-                            f"可用资金: ${available_capital:.2f}, "
-                            f"原因: 价格接近下轨(${lower:.2f}), "
-                            f"通道宽度: {(upper-lower)/price*100:.2f}%"
-                        )
-                        
-                elif channel_position == "UPPER" and position == 1:
-                    # 计算卖出收益
-                    position = 0
-                    pnl = (price - entry_price) * trade_size
-                    total_pnl += pnl
-                    available_capital += (trade_size * price)
-                    
-                    if pnl > 0:
-                        winning_trades += 1
-                    
-                    # 记录交易    
-                    trade = Trade("SELL", price, trade_size, timestamp, upper)
-                    current_data = {
-                        'current_price': price,
-                        'upper_channel': upper,
-                        'lower_channel': lower
-                    }
-                    self.save_trade_to_csv(trade, current_data)
-                    
-                    # 获取其他指标
-                    upper_dist = abs(price - upper) / upper
-                    lower_dist = abs(price - lower) / lower
-                    adjusted_threshold = self.adjust_threshold(
-                        (upper-lower)/price, baseline_width)
-
-                    trade_records.append({
+                unrealized_pnl = (price - entry_price) * position_size if position_size > 0 else 0
+                
+                # 记录下轨信号
+                if lower_dist <= (adjusted_threshold * 100):
+                    signal = {
                         'time': timestamp,
-                        'action': 'SELL',
                         'price': price,
-                        'size': trade_size,
-                        'pnl': pnl,
+                        'trigger_type': 'NEAR_LOWER',
+                        'channel_state': channel_state,
+                        'channel_width': f"{current_width*100:.2f}%",
+                        'baseline_width': baseline_width * 100,
+                        'upper_dist': upper_dist,
+                        'lower_dist': lower_dist,
+                        'position_size': position_size,
                         'upper_price': upper,
                         'lower_price': lower,
-                        'upper_dist': upper_dist * 100,
-                        'lower_dist': lower_dist * 100,
-                        'available_capital': available_capital,
-                        'reason': f'价格(${price:.2f})接近上轨(${upper:.2f})',
-                        'channel_width': f'{(upper-lower)/price*100:.2f}%',
+                        'available_capital': available_capital
+                    }
+
+                    if position_size == 0:
+                        if channel_position == "LOWER":
+                            shares_by_capital = int(available_capital / price)
+                            shares_by_limit = int(max_trade / price)
+                            max_shares = min(shares_by_capital, shares_by_limit)
+                            
+                            if max_shares >= 10:
+                                position_size = max_shares
+                                entry_price = price
+                                available_capital -= (position_size * price)
+                                total_trades += 1
+
+                                signal.update({
+                                    'action': 'BUY',
+                                    'size': position_size,
+                                    'reason': f'价格(${price:.2f})接近下轨(${lower:.2f})且无持仓，执行买入'
+                                })
+                                trade_records.append(signal)
+                            else:
+                                signal.update({
+                                    'action': 'NO_ACTION',
+                                    'reason': (f'虽然接近下轨(${lower:.2f})但资金条件不满足:\n'
+                                            f'- 可用资金: ${available_capital:.2f}\n'
+                                            f'- 资金允许买入: {shares_by_capital}股\n'
+                                            f'- 限额允许买入: {shares_by_limit}股\n'
+                                            f'- 最终可买: {max_shares}股 < 最小交易量10股\n'
+                                            f'- 通道状态: {channel_state}\n'
+                                            f'- 通道宽度比: {width_ratio:.2f}')
+                                })
+                        else:
+                            signal.update({
+                                'action': 'NO_ACTION',
+                                'reason': (f'虽然价格(${price:.2f})接近下轨(${lower:.2f})但通道条件未触发:\n'
+                                        f'- 通道状态: {channel_state}\n'
+                                        f'- 通道宽度比: {width_ratio:.2f}\n'
+                                        f'- 触发阈值: {adjusted_threshold:.4f}\n'
+                                        f'- 实际距离: {lower_dist:.4f}%')
+                            })
+                    else:
+                        signal.update({
+                            'action': 'NO_ACTION',
+                            'reason': (f'虽然接近下轨(${lower:.2f})但已有持仓:\n'
+                                    f'- 当前持仓: {position_size}股\n'
+                                    f'- 持仓均价: ${entry_price:.2f}\n'
+                                    f'- 当前浮动盈亏: ${unrealized_pnl:.2f}\n'
+                                    f'- 通道状态: {channel_state}\n'
+                                    f'- 通道宽度比: {width_ratio:.2f}')
+                        })
+                        
+                    all_signals.append(signal)
+
+                # 记录上轨信号
+                if upper_dist <= (adjusted_threshold * 100):
+                    signal = {
+                        'time': timestamp,
+                        'price': price,
+                        'trigger_type': 'NEAR_UPPER',
+                        'channel_state': channel_state,
+                        'channel_width': f"{current_width*100:.2f}%",
                         'baseline_width': baseline_width * 100,
-                        'adjusted_threshold': adjusted_threshold * 100,
-                        'can_trade': self.can_trade()
-                    })
-                    
-                    self.logger.info(
-                        f"卖出 - 时间: {timestamp}, "
-                        f"数量: {trade_size}股, "
-                        f"价格: ${price:.2f}, "
-                        f"盈亏: ${pnl:.2f}, "
-                        f"可用资金: ${available_capital:.2f}, "
-                        f"原因: 价格接近上轨(${upper:.2f}), "
-                        f"通道宽度: {(upper-lower)/price*100:.2f}%"
-                    )
-            
-            # 计算回测结果
+                        'upper_dist': upper_dist,
+                        'lower_dist': lower_dist,
+                        'position_size': position_size,
+                        'upper_price': upper,
+                        'lower_price': lower,
+                        'available_capital': available_capital
+                    }
+
+                    if position_size > 0:
+                        if channel_position == "UPPER":
+                            realized_pnl = (price - entry_price) * position_size
+                            total_pnl += realized_pnl
+                            available_capital += (position_size * price)
+                            
+                            if realized_pnl > 0:
+                                winning_trades += 1
+                            
+                            signal.update({
+                                'action': 'SELL',
+                                'size': position_size,
+                                'pnl': realized_pnl,
+                                'reason': f'价格(${price:.2f})接近上轨(${upper:.2f})且有持仓{position_size}股，执行卖出'
+                            })
+                            trade_records.append(signal)
+                            position_size = 0
+                            entry_price = 0
+                        else:
+                            signal.update({
+                                'action': 'NO_ACTION',
+                                'reason': (f'虽然价格(${price:.2f})接近上轨(${upper:.2f})但通道条件未触发:\n'
+                                        f'- 通道状态: {channel_state}\n'
+                                        f'- 通道宽度比: {width_ratio:.2f}\n'
+                                        f'- 触发阈值: {adjusted_threshold:.4f}\n'
+                                        f'- 实际距离: {upper_dist:.4f}%')
+                            })
+                    else:
+                        signal.update({
+                            'action': 'NO_ACTION',
+                            'reason': (f'虽然接近上轨(${upper:.2f})但无持仓:\n'
+                                    f'- 通道状态: {channel_state}\n'
+                                    f'- 通道宽度比: {width_ratio:.2f}\n'
+                                    f'- 触发阈值: {adjusted_threshold:.4f}')
+                        })
+                        
+                    all_signals.append(signal)
+
+            # [结果计算和返回部分保持不变]...
             win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
             
             self.logger.info("\n=== 回测结果 ===")
@@ -1034,12 +1060,200 @@ class ImprovedDonchianStrategy:
                 'win_rate': win_rate,
                 'total_pnl': total_pnl,
                 'final_capital': available_capital,
-                'trade_records': trade_records
+                'trade_records': trade_records,
+                'all_signals': all_signals
             }
             
         except Exception as e:
             self.logger.error(f"回测过程中发生错误: {str(e)}")
             raise
+    # def backtest(self, start_date=None, end_date=None, initial_position=0):
+    #     try:
+    #         # 使用策略初始化时的参数
+    #         symbol = self.symbol            
+    #         test_capital = self.capital     
+    #         test_period = self.period       
+    #         max_trade = self.max_capital_per_trade  
+            
+    #         # 获取数据
+    #         stock = yf.Ticker(symbol)
+    #         if start_date and end_date:
+    #             hist = stock.history(start=start_date, end=end_date, interval='1m')
+    #         else:
+    #             hist = stock.history(period='4d', interval='1m')
+                
+    #         if hist.empty:
+    #             self.logger.error("未能获取历史数据")
+    #             return None
+                
+    #         # 计算通道和基准宽度    
+    #         hist['upper_channel'] = hist['High'].rolling(window=test_period).max()
+    #         hist['lower_channel'] = hist['Low'].rolling(window=test_period).min()
+    #         baseline_width = self.calculate_baseline_channel_width(hist)
+            
+    #         # 记录基本信息
+    #         self.logger.info(f"回测时间范围: {hist.index[0]} 至 {hist.index[-1]}")
+    #         self.logger.info(f"数据点数量: {len(hist)}")
+    #         self.logger.info(f"回测标的: {symbol}")
+    #         self.logger.info(f"初始资金: ${test_capital}")
+    #         self.logger.info(f"通道周期: {test_period}")
+    #         self.logger.info(f"单次最大交易额: ${max_trade}")
+    #         self.logger.info(f"基准通道宽度: {baseline_width*100:.2f}%")
+
+    #         # 初始化回测数据
+    #         available_capital = test_capital
+    #         total_trades = 0
+    #         winning_trades = 0
+    #         total_pnl = 0
+    #         position = initial_position
+    #         entry_price = 0
+    #         trade_size = 0
+    #         trade_records = []
+            
+    #         # 遍历数据
+    #         for i in range(len(hist)):
+    #             row = hist.iloc[i]
+    #             price = row['Close']
+    #             upper = row['upper_channel']
+    #             lower = row['lower_channel']
+    #             timestamp = hist.index[i]
+                
+    #             # 检查是否触及通道
+    #             lookback_data = hist.iloc[max(0, i-test_period):i+1]
+    #             channel_position = self.is_near_channel(price, upper, lower, lookback_data)
+                
+    #             if channel_position == "LOWER" and position == 0:
+    #                 # 计算买入数量
+    #                 max_shares = min(
+    #                     int(available_capital / price),
+    #                     int(max_trade / price)
+    #                 )
+    #                 trade_size = max_shares
+                    
+    #                 if trade_size > 0:
+    #                     # 更新持仓
+    #                     position = 1
+    #                     entry_price = price
+    #                     available_capital -= (trade_size * price)
+    #                     total_trades += 1
+                        
+    #                     # 记录交易
+    #                     trade = Trade("BUY", price, trade_size, timestamp, lower)
+    #                     current_data = {
+    #                         'current_price': price,
+    #                         'upper_channel': upper,
+    #                         'lower_channel': lower
+    #                     }
+    #                     self.save_trade_to_csv(trade, current_data)
+                        
+    #                     # 获取其他指标
+    #                     upper_dist = abs(price - upper) / upper
+    #                     lower_dist = abs(price - lower) / lower
+    #                     adjusted_threshold = self.adjust_threshold(
+    #                         (upper-lower)/price, baseline_width)
+                        
+    #                     trade_records.append({
+    #                         'time': timestamp,
+    #                         'action': 'BUY',
+    #                         'price': price,
+    #                         'size': trade_size,
+    #                         'upper_price': upper,
+    #                         'lower_price': lower,
+    #                         'upper_dist': upper_dist * 100,
+    #                         'lower_dist': lower_dist * 100,
+    #                         'available_capital': available_capital,
+    #                         'reason': f'价格(${price:.2f})接近下轨(${lower:.2f})',
+    #                         'channel_width': f'{(upper-lower)/price*100:.2f}%',
+    #                         'baseline_width': baseline_width * 100,
+    #                         'adjusted_threshold': adjusted_threshold * 100,
+    #                         'can_trade': self.can_trade()
+    #                     })
+                        
+    #                     self.logger.info(
+    #                         f"买入 - 时间: {timestamp}, "
+    #                         f"数量: {trade_size}股, "
+    #                         f"价格: ${price:.2f}, "
+    #                         f"可用资金: ${available_capital:.2f}, "
+    #                         f"原因: 价格接近下轨(${lower:.2f}), "
+    #                         f"通道宽度: {(upper-lower)/price*100:.2f}%"
+    #                     )
+                        
+    #             elif channel_position == "UPPER" and position == 1:
+    #                 # 计算卖出收益
+    #                 position = 0
+    #                 pnl = (price - entry_price) * trade_size
+    #                 total_pnl += pnl
+    #                 available_capital += (trade_size * price)
+                    
+    #                 if pnl > 0:
+    #                     winning_trades += 1
+                    
+    #                 # 记录交易    
+    #                 trade = Trade("SELL", price, trade_size, timestamp, upper)
+    #                 current_data = {
+    #                     'current_price': price,
+    #                     'upper_channel': upper,
+    #                     'lower_channel': lower
+    #                 }
+    #                 self.save_trade_to_csv(trade, current_data)
+                    
+    #                 # 获取其他指标
+    #                 upper_dist = abs(price - upper) / upper
+    #                 lower_dist = abs(price - lower) / lower
+    #                 adjusted_threshold = self.adjust_threshold(
+    #                     (upper-lower)/price, baseline_width)
+
+    #                 trade_records.append({
+    #                     'time': timestamp,
+    #                     'action': 'SELL',
+    #                     'price': price,
+    #                     'size': trade_size,
+    #                     'pnl': pnl,
+    #                     'upper_price': upper,
+    #                     'lower_price': lower,
+    #                     'upper_dist': upper_dist * 100,
+    #                     'lower_dist': lower_dist * 100,
+    #                     'available_capital': available_capital,
+    #                     'reason': f'价格(${price:.2f})接近上轨(${upper:.2f})',
+    #                     'channel_width': f'{(upper-lower)/price*100:.2f}%',
+    #                     'baseline_width': baseline_width * 100,
+    #                     'adjusted_threshold': adjusted_threshold * 100,
+    #                     'can_trade': self.can_trade()
+    #                 })
+                    
+    #                 self.logger.info(
+    #                     f"卖出 - 时间: {timestamp}, "
+    #                     f"数量: {trade_size}股, "
+    #                     f"价格: ${price:.2f}, "
+    #                     f"盈亏: ${pnl:.2f}, "
+    #                     f"可用资金: ${available_capital:.2f}, "
+    #                     f"原因: 价格接近上轨(${upper:.2f}), "
+    #                     f"通道宽度: {(upper-lower)/price*100:.2f}%"
+    #                 )
+            
+    #         # 计算回测结果
+    #         win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
+            
+    #         self.logger.info("\n=== 回测结果 ===")
+    #         self.logger.info(f"初始资金: ${test_capital}")
+    #         self.logger.info(f"最终资金: ${available_capital}")
+    #         self.logger.info(f"总盈亏: ${total_pnl:.2f}")
+    #         self.logger.info(f"总交易次数: {total_trades}")
+    #         self.logger.info(f"盈利交易: {winning_trades}")
+    #         self.logger.info(f"胜率: {win_rate:.2f}%")
+            
+    #         return {
+    #             'total_trades': total_trades,
+    #             'winning_trades': winning_trades,
+    #             'win_rate': win_rate,
+    #             'total_pnl': total_pnl,
+    #             'final_capital': available_capital,
+    #             'trade_records': trade_records
+    #         }
+            
+    #     except Exception as e:
+    #         self.logger.error(f"回测过程中发生错误: {str(e)}")
+    #         raise
     
     def run_strategy(self):
         """运行策略"""
