@@ -5,7 +5,9 @@
 * `mock_tws.py`: 模拟TWS客户端
 * `test_strategy.py`: 测试文件
 * 2024/11/27
-* 待更新：1.盈利太tm低了,2,日志输入至csv
+* 待更新：1.盈利太tm低了,2,日志输入至csv,3如果差价大可以适当提升单次交易限额
+* 2024/11/17晚更新：窄通道时：阈值 * 1.2，提高标准避免震荡
+宽通道时：阈值 * 0.8，降低标准提前入场
 * INFO:DonchianStrategy_TSLA:初始资金: $1000
 INFO:DonchianStrategy_TSLA:最终资金: $1002.6782836914062
 INFO:DonchianStrategy_TSLA:总盈亏: $2.68

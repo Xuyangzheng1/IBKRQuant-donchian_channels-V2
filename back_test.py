@@ -17,7 +17,7 @@ class TestDonchianStrategy(unittest.TestCase):
         
         # 初始化策略
         self.strategy = ImprovedDonchianStrategy(
-           symbol='TSLA',           # 交易标的
+           symbol='aapl',           # 交易标的
            capital=100000,          # 初始资金
            period=20,               # 通道周期
            base_tranches=3,         # 分批数

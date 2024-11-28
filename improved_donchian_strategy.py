@@ -1,6 +1,4 @@
 
-
-
 import yfinance as yf
 from ibapi.client import EClient
 from ibapi.wrapper import EWrapper
@@ -13,7 +11,8 @@ import threading
 import time
 import logging
 import os
-
+#通道越窄，阈值越高还是越低？
+#操作后是否有间隔？（测试环境中不检查间隔）
 class Trade:
     def __init__(self, action, price, quantity, timestamp, channel_price):
         self.action = action
@@ -188,20 +187,22 @@ class ImprovedDonchianStrategy:
             base_threshold = self.alert_threshold
             
             if width_ratio < 0.8:  # 当前通道比基准窄20%以上
-                # 降低阈值，让信号更容易触发
-                adjusted_threshold = base_threshold * 0.8
-                self.logger.info(f"通道较窄，降低阈值至: {adjusted_threshold*100:.3f}%")
-            elif width_ratio > 1.2:  # 当前通道比基准宽20%以上
-                # 提高阈值，让信号更难触发
+                # 提高阈值，更严格，避免震荡假突破
                 adjusted_threshold = base_threshold * 1.2
-                self.logger.info(f"通道较宽，提高阈值至: {adjusted_threshold*100:.3f}%")
+                self.logger.info(f"通道较窄，提高阈值至: {adjusted_threshold*100:.3f}%，避免震荡假突破")
+                
+            elif width_ratio > 1.2:  # 当前通道比基准宽20%以上
+                # 降低阈值，更宽松，提前捕捉机会
+                adjusted_threshold = base_threshold * 0.8
+                self.logger.info(f"通道较宽，降低阈值至: {adjusted_threshold*100:.3f}%，提前捕捉机会")
+                
             else:
                 # 保持基础阈值
                 adjusted_threshold = base_threshold
                 self.logger.info(f"通道正常，使用基础阈值: {adjusted_threshold*100:.3f}%")
-                
+                    
             return adjusted_threshold
-            
+                
         except Exception as e:
             self.logger.error(f"调整阈值错误: {str(e)}")
             return self.alert_threshold
@@ -326,7 +327,7 @@ class ImprovedDonchianStrategy:
 
     def can_trade(self):
         """检查是否可以交易"""
-        # 在测试环境中不检查交易间隔
+        #在测试环境中不检查交易间隔
         if hasattr(self, '_test_mode') and self._test_mode:
             return True
         if not self.last_trade_time:
@@ -490,17 +491,15 @@ class ImprovedDonchianStrategy:
     # 在 ImprovedDonchianStrategy 类中
 
     def backtest(self, start_date=None, end_date=None, initial_position=0):
-        """回测功能"""
         try:
             # 使用策略初始化时的参数
-            symbol = self.symbol
-            test_capital = self.capital        # 初始资金
-            test_period = self.period          # 通道周期
-            max_trade = self.max_capital_per_trade  # 单次最大交易金额
+            symbol = self.symbol            
+            test_capital = self.capital     
+            test_period = self.period       
+            max_trade = self.max_capital_per_trade  
             
-            # 获取测试数据
+            # 获取数据
             stock = yf.Ticker(symbol)
-            
             if start_date and end_date:
                 hist = stock.history(start=start_date, end=end_date, interval='1m')
             else:
@@ -510,17 +509,22 @@ class ImprovedDonchianStrategy:
                 self.logger.error("未能获取历史数据")
                 return None
                 
+            # 计算通道和基准宽度    
+            hist['upper_channel'] = hist['High'].rolling(window=test_period).max()
+            hist['lower_channel'] = hist['Low'].rolling(window=test_period).min()
+            baseline_width = self.calculate_baseline_channel_width(hist)
+            
+            # 记录基本信息
             self.logger.info(f"回测时间范围: {hist.index[0]} 至 {hist.index[-1]}")
             self.logger.info(f"数据点数量: {len(hist)}")
-            
-            # 使用初始化参数
             self.logger.info(f"回测标的: {symbol}")
             self.logger.info(f"初始资金: ${test_capital}")
             self.logger.info(f"通道周期: {test_period}")
             self.logger.info(f"单次最大交易额: ${max_trade}")
+            self.logger.info(f"基准通道宽度: {baseline_width*100:.2f}%")
 
             # 初始化回测数据
-            available_capital = test_capital  # 可用资金
+            available_capital = test_capital
             total_trades = 0
             winning_trades = 0
             total_pnl = 0
@@ -528,10 +532,6 @@ class ImprovedDonchianStrategy:
             entry_price = 0
             trade_size = 0
             trade_records = []
-            
-            # 使用test_period计算通道
-            hist['upper_channel'] = hist['High'].rolling(window=test_period).max()
-            hist['lower_channel'] = hist['Low'].rolling(window=test_period).min()
             
             # 遍历数据
             for i in range(len(hist)):
@@ -542,39 +542,54 @@ class ImprovedDonchianStrategy:
                 timestamp = hist.index[i]
                 
                 # 检查是否触及通道
-                lookback_data = hist.iloc[max(0, i-test_period):i+1]  # 使用test_period
+                lookback_data = hist.iloc[max(0, i-test_period):i+1]
                 channel_position = self.is_near_channel(price, upper, lower, lookback_data)
-                    
+                
                 if channel_position == "LOWER" and position == 0:
-                    # 计算可买数量（考虑资金限制）
+                    # 计算买入数量
                     max_shares = min(
-                        int(available_capital / price),  # 可用资金能买的数量
-                        int(max_trade / price)          # 单次交易限制的数量
+                        int(available_capital / price),
+                        int(max_trade / price)
                     )
                     trade_size = max_shares
                     
                     if trade_size > 0:
+                        # 更新持仓
                         position = 1
                         entry_price = price
-                        available_capital -= (trade_size * price)  # 更新可用资金
+                        available_capital -= (trade_size * price)
                         total_trades += 1
+                        
+                        # 记录交易
                         trade = Trade("BUY", price, trade_size, timestamp, lower)
-
                         current_data = {
                             'current_price': price,
                             'upper_channel': upper,
                             'lower_channel': lower
                         }
-                        self.save_trade_to_csv(trade, current_data)  # 保存到CSV
+                        self.save_trade_to_csv(trade, current_data)
+                        
+                        # 获取其他指标
+                        upper_dist = abs(price - upper) / upper
+                        lower_dist = abs(price - lower) / lower
+                        adjusted_threshold = self.adjust_threshold(
+                            (upper-lower)/price, baseline_width)
                         
                         trade_records.append({
                             'time': timestamp,
                             'action': 'BUY',
                             'price': price,
                             'size': trade_size,
+                            'upper_price': upper,
+                            'lower_price': lower,
+                            'upper_dist': upper_dist * 100,
+                            'lower_dist': lower_dist * 100,
                             'available_capital': available_capital,
                             'reason': f'价格(${price:.2f})接近下轨(${lower:.2f})',
-                            'channel_width': f'{(upper-lower)/price*100:.2f}%'
+                            'channel_width': f'{(upper-lower)/price*100:.2f}%',
+                            'baseline_width': baseline_width * 100,
+                            'adjusted_threshold': adjusted_threshold * 100,
+                            'can_trade': self.can_trade()
                         })
                         
                         self.logger.info(
@@ -585,16 +600,18 @@ class ImprovedDonchianStrategy:
                             f"原因: 价格接近下轨(${lower:.2f}), "
                             f"通道宽度: {(upper-lower)/price*100:.2f}%"
                         )
-                    
+                        
                 elif channel_position == "UPPER" and position == 1:
+                    # 计算卖出收益
                     position = 0
                     pnl = (price - entry_price) * trade_size
                     total_pnl += pnl
-                    available_capital += (trade_size * price)  # 更新可用资金
+                    available_capital += (trade_size * price)
                     
                     if pnl > 0:
                         winning_trades += 1
                     
+                    # 记录交易    
                     trade = Trade("SELL", price, trade_size, timestamp, upper)
                     current_data = {
                         'current_price': price,
@@ -602,6 +619,12 @@ class ImprovedDonchianStrategy:
                         'lower_channel': lower
                     }
                     self.save_trade_to_csv(trade, current_data)
+                    
+                    # 获取其他指标
+                    upper_dist = abs(price - upper) / upper
+                    lower_dist = abs(price - lower) / lower
+                    adjusted_threshold = self.adjust_threshold(
+                        (upper-lower)/price, baseline_width)
 
                     trade_records.append({
                         'time': timestamp,
@@ -609,9 +632,16 @@ class ImprovedDonchianStrategy:
                         'price': price,
                         'size': trade_size,
                         'pnl': pnl,
+                        'upper_price': upper,
+                        'lower_price': lower,
+                        'upper_dist': upper_dist * 100,
+                        'lower_dist': lower_dist * 100,
                         'available_capital': available_capital,
                         'reason': f'价格(${price:.2f})接近上轨(${upper:.2f})',
-                        'channel_width': f'{(upper-lower)/price*100:.2f}%'
+                        'channel_width': f'{(upper-lower)/price*100:.2f}%',
+                        'baseline_width': baseline_width * 100,
+                        'adjusted_threshold': adjusted_threshold * 100,
+                        'can_trade': self.can_trade()
                     })
                     
                     self.logger.info(
@@ -624,6 +654,7 @@ class ImprovedDonchianStrategy:
                         f"通道宽度: {(upper-lower)/price*100:.2f}%"
                     )
             
+            # 计算回测结果
             win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
             
             self.logger.info("\n=== 回测结果 ===")
