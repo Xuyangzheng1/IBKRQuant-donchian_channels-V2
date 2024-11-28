@@ -1,4 +1,5 @@
 
+from decimal import Decimal
 import yfinance as yf
 from ibapi.client import EClient
 from ibapi.wrapper import EWrapper
@@ -11,8 +12,13 @@ import threading
 import time
 import logging
 import os
+import logging
+from datetime import datetime
+import time
 #通道越窄，阈值越高还是越低？
 #操作后是否有间隔？（测试环境中不检查间隔）
+#应对连续下跌情况
+#持仓显示
 class Trade:
     def __init__(self, action, price, quantity, timestamp, channel_price):
         self.action = action
@@ -24,21 +30,39 @@ class Trade:
 class TradingBot(EWrapper, EClient):
     def __init__(self):
         EClient.__init__(self, self)
-        self.positions = {'TSLA': 0}  # 初始化仓位字典
+        self.positions = {}
         self.current_price = None
         self.order_id = 0
-        self.market_depth = {}
+        self.position_received = False
+        self.logger = logging.getLogger(__name__)
         
     def error(self, reqId, errorCode, errorString):
         logging.error(f'Error {errorCode}: {errorString}')
         
     def nextValidId(self, orderId):
         self.order_id = orderId
+        self._connected = True  # 使用新的变量名
         logging.info("Connected to TWS")
+        self.reqPositions()
         
-    def position(self, account, contract, pos, avgCost):
-        self.positions[contract.symbol] = pos
+    def position(self, account: str, contract: Contract, pos: Decimal, avgCost: float):
+        """接收持仓回调"""
+        symbol = contract.symbol
+        self.logger.info(f"Position received - Symbol: {symbol}, Position: {pos}, AvgCost: {avgCost}")
         
+        self.positions[symbol] = {
+            'position': float(pos),
+            'avg_cost': float(avgCost),
+            'account': account,
+            'last_update': datetime.now()
+        }
+    def positionEnd(self):
+        """持仓数据接收完成"""
+        self.position_received = True
+        self.logger.info("Position data end")
+    def isConnected(self):  # 添加方法来检查连接状态
+        """返回连接状态"""
+        return self.isConnected   
     def tickPrice(self, reqId, tickType, price, attrib):
         if tickType == 4:
             self.current_price = price
@@ -58,9 +82,212 @@ class TradingBot(EWrapper, EClient):
             if position < len(self.market_depth[reqId][depth_side]):
                 del self.market_depth[reqId][depth_side][position]
 
+
+class Position:
+    def __init__(self, symbol, logger=None):
+        self.symbol = symbol
+        self.quantity = 0
+        self.avg_cost = 0
+        self.total_cost = 0
+        self.realized_pnl = 0
+        self.unrealized_pnl = 0
+        self.last_update_time = None
+        self.logger = logger or logging.getLogger(__name__)
+        self.trades_today = []
+        
+    def update_from_ib(self, quantity, avg_cost):
+        """从IB更新持仓信息"""
+        try:
+            old_quantity = self.quantity
+            self.quantity = quantity
+            if quantity > 0:
+                self.avg_cost = avg_cost
+                self.total_cost = quantity * avg_cost
+            else:
+                self.avg_cost = 0
+                self.total_cost = 0
+                
+            self.last_update_time = datetime.now()
+            
+            self.logger.info(f"持仓更新 - {self.symbol}")
+            self.logger.info(f"数量: {old_quantity} -> {self.quantity}")
+            self.logger.info(f"平均成本: ${self.avg_cost:.2f}")
+            self.logger.info(f"总成本: ${self.total_cost:.2f}")
+            
+        except Exception as e:
+            self.logger.error(f"更新持仓信息时出错: {str(e)}")
+            
+    def update_market_price(self, current_price):
+        """更新市场价格相关信息"""
+        try:
+            if self.quantity > 0:
+                self.unrealized_pnl = self.quantity * (current_price - self.avg_cost)
+            else:
+                self.unrealized_pnl = 0
+                
+        except Exception as e:
+            self.logger.error(f"更新市场价格信息时出错: {str(e)}")
+            
+    def record_trade(self, action, quantity, price, timestamp=None):
+        """记录交易"""
+        try:
+            timestamp = timestamp or datetime.now()
+            
+            if action == "SELL":
+                if self.quantity > 0:
+                    # 计算已实现盈亏
+                    trade_pnl = quantity * (price - self.avg_cost)
+                    self.realized_pnl += trade_pnl
+                    
+                    # 更新持仓
+                    self.quantity -= quantity
+                    if self.quantity <= 0:
+                        self.quantity = 0
+                        self.avg_cost = 0
+                        self.total_cost = 0
+                    else:
+                        self.total_cost = self.quantity * self.avg_cost
+                        
+            elif action == "BUY":
+                # 更新平均成本和总成本
+                total_cost = self.total_cost + (quantity * price)
+                self.quantity += quantity
+                self.avg_cost = total_cost / self.quantity
+                self.total_cost = total_cost
+                
+            # 记录交易
+            trade = {
+                'timestamp': timestamp,
+                'action': action,
+                'quantity': quantity,
+                'price': price,
+                'position_after': self.quantity,
+                'avg_cost_after': self.avg_cost,
+                'realized_pnl': self.realized_pnl
+            }
+            self.trades_today.append(trade)
+            
+            # 记录日志
+            self.logger.info(f"\n=== 交易记录 ===")
+            self.logger.info(f"时间: {timestamp}")
+            self.logger.info(f"动作: {action}")
+            self.logger.info(f"数量: {quantity}")
+            self.logger.info(f"价格: ${price:.2f}")
+            self.logger.info(f"交易后持仓: {self.quantity}")
+            self.logger.info(f"交易后均价: ${self.avg_cost:.2f}")
+            if action == "SELL":
+                self.logger.info(f"已实现盈亏: ${self.realized_pnl:.2f}")
+                
+        except Exception as e:
+            self.logger.error(f"记录交易时出错: {str(e)}")
+            
+    def get_daily_summary(self):
+        """获取每日交易摘要"""
+        return {
+            'date': datetime.now().strftime('%Y-%m-%d'),
+            'symbol': self.symbol,
+            'total_trades': len(self.trades_today),
+            'current_position': self.quantity,
+            'avg_cost': self.avg_cost,
+            'realized_pnl': self.realized_pnl,
+            'unrealized_pnl': self.unrealized_pnl,
+            'total_pnl': self.realized_pnl + self.unrealized_pnl
+        }
+        
+    def reset_daily_trades(self):
+        """重置每日交易记录"""
+        self.trades_today = []
+        
+    def verify_position(self, ib_quantity, ib_avg_cost):
+        """验证并纠正持仓信息"""
+        if self.quantity != ib_quantity:
+            self.logger.warning(f"持仓不一致 - 本地: {self.quantity}, IB: {ib_quantity}")
+            self.update_from_ib(ib_quantity, ib_avg_cost)
+            return True
+        return False
+        
+    def get_position_info(self):
+        """获取当前持仓信息"""
+        return {
+            'symbol': self.symbol,
+            'quantity': self.quantity,
+            'avg_cost': self.avg_cost,
+            'total_cost': self.total_cost,
+            'realized_pnl': self.realized_pnl,
+            'unrealized_pnl': self.unrealized_pnl,
+            'last_update': self.last_update_time
+        }
+
+class PositionManager:
+    def __init__(self, bot, logger=None):
+        self.bot = bot
+        self.logger = logger or logging.getLogger(__name__)
+        self.positions = {}
+        self.last_verification_time = None
+        self.verification_interval = 300  # 5分钟验证一次
+        
+    def initialize_position(self, symbol):
+        """初始化品种的持仓跟踪"""
+        if symbol not in self.positions:
+            self.positions[symbol] = Position(symbol, self.logger)
+            
+    def update_from_ib(self):
+        """从IB更新所有持仓信息"""
+        try:
+            # 请求持仓更新
+            self.bot.reqPositions()
+            
+            # 等待持仓数据
+            wait_count = 0
+            while not self.bot.position_received and wait_count < 10:
+                time.sleep(0.5)
+                wait_count += 1
+                
+            if not self.bot.position_received:
+                self.logger.warning("未能获取持仓数据")
+                return False
+                
+            # 更新持仓信息
+            for symbol, pos_data in self.bot.positions.items():
+                if symbol in self.positions:
+                    quantity = pos_data.get('position', 0)
+                    avg_cost = pos_data.get('avg_cost', 0)
+                    self.positions[symbol].update_from_ib(quantity, avg_cost)
+                    
+            self.last_verification_time = datetime.now()
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"更新IB持仓信息时出错: {str(e)}")
+            return False
+            
+    def verify_positions(self, force=False):
+        """验证所有持仓信息"""
+        now = datetime.now()
+        if not force and self.last_verification_time and \
+           (now - self.last_verification_time).seconds < self.verification_interval:
+            return
+            
+        self.update_from_ib()
+        
+    def record_trade(self, symbol, action, quantity, price):
+        """记录交易"""
+        if symbol in self.positions:
+            self.positions[symbol].record_trade(action, quantity, price)
+            
+    def get_position(self, symbol):
+        """获取指定品种的持仓信息"""
+        return self.positions.get(symbol)
+        
+    def get_all_positions(self):
+        """获取所有持仓信息"""
+        return {symbol: pos.get_position_info() for symbol, pos in self.positions.items()}
+    
 class ImprovedDonchianStrategy:
     def __init__(self, symbol, capital=100000, period=20, base_tranches=3, 
                  alert_threshold=0.004, max_capital_per_trade=50000):
+        print("开始初始化策略...")  # 调试日志
+        
         # 基础参数
         self.symbol = symbol
         self.capital = capital
@@ -68,31 +295,55 @@ class ImprovedDonchianStrategy:
         self.base_tranches = base_tranches
         self.alert_threshold = alert_threshold
         self.max_capital_per_trade = max_capital_per_trade
+        self.last_trading_day = None  # 初始化交易日变量
         
-        # 交易相关
+        print(f"基础参数设置完成 - 交易品种: {symbol}")  # 调试日志
+        
+        # 设置日志目录
+        self.log_dir = r"F:\shares\twspy\trading_logs\trading_logs"
+        self.csv_dir = r"F:\shares\twspy\trading_logs\trading_results"
+        
+        # 确保目录存在
+        for directory in [self.log_dir, self.csv_dir]:
+            if not os.path.exists(directory):
+                os.makedirs(directory)
+                print(f"创建目录: {directory}")  # 调试日志
+        
+        # 初始化交易状态
         self.position = 0
         self.current_position_size = 0
         self.total_cost_basis = 0
         self.realized_pnl = 0
         self.last_trade_time = None
         self.min_trade_interval = 300
-        
-        # 交易记录
         self.trades = []
         self.daily_trades = []
-        self.trade_history = []
         
-        # 日志设置
-        self.log_dir = r"F:\shares\twspy\trading_logs\trading_logs"
-        self.csv_dir = r"F:\shares\twspy\trading_logs\trading_results"
-        for directory in [self.log_dir, self.csv_dir]:
-            if not os.path.exists(directory):
-                os.makedirs(directory)
+        print("开始设置日志系统...")  # 调试日志
         
-        # 初始化交易接口和日志
-        self.bot = TradingBot()
+        # 设置基础日志配置
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        )
+        
+        # 初始化组件
         self.logger = self._setup_logger()
+        print("日志系统设置完成")  # 调试日志
+        
         self.csv_filename = self._setup_csv_file()
+        print("CSV文件设置完成")  # 调试日志
+        
+        print("初始化交易接口...")  # 调试日志
+        self.bot = TradingBot()
+        print("交易接口初始化完成")  # 调试日志
+        
+        print("初始化持仓管理...")  # 调试日志
+        self.position_manager = PositionManager(self.bot, self.logger)
+        self.position_manager.initialize_position(symbol)
+        print("持仓管理初始化完成")  # 调试日志
+        
+        print("策略初始化完成!")  # 调试日志
         
     def calculate_position_size(self, price):
         """计算交易量"""
@@ -106,26 +357,9 @@ class ImprovedDonchianStrategy:
             return 0
     def verify_position(self):
         """验证当前仓位信息"""
-        try:
-            # 从IB获取实际仓位
-            ib_position = self.bot.positions.get(self.symbol, 0)
-            
-            # 检查是否与我们的记录一致
-            if ib_position != self.current_position_size:
-                self.logger.warning(f"仓位不一致! IB仓位: {ib_position}, 本地记录: {self.current_position_size}")
-                # 以IB仓位为准
-                self.current_position_size = ib_position
-                
-            # 确保没有负仓位
-            if self.current_position_size < 0:
-                self.logger.error(f"检测到负仓位: {self.current_position_size}，立即修正")
-                self.current_position_size = 0
-                
-            return self.current_position_size
-            
-        except Exception as e:
-            self.logger.error(f"验证仓位错误: {str(e)}")
-            return 0
+        self.position_manager.verify_positions()
+        position = self.position_manager.get_position(self.symbol)
+        return position.quantity if position else 0
 
     def _setup_logger(self):
         """设置日志系统"""
@@ -141,7 +375,18 @@ class ImprovedDonchianStrategy:
         logger.addHandler(fh)
         
         return logger
-
+    def update_position_info(self, action, filled_quantity, price):
+        """更新持仓信息"""
+        try:
+            self.position_manager.record_trade(self.symbol, action, filled_quantity, price)
+            position = self.position_manager.get_position(self.symbol)
+            self.current_position_size = position.quantity
+            self.total_cost_basis = position.total_cost
+            self.realized_pnl = position.realized_pnl
+            
+        except Exception as e:
+            self.logger.error(f"更新持仓信息错误: {str(e)}")
+            self.verify_position()
     def _setup_csv_file(self):
         """设置CSV文件"""
         timestamp = datetime.now().strftime('%Y%m%d')
@@ -688,22 +933,29 @@ class ImprovedDonchianStrategy:
             # 连接交易接口
             self.bot.connect("127.0.0.1", 7497, 1)
             
-            api_thread = threading.Thread(target=self.bot.run)
-            api_thread.daemon = True
+            api_thread = threading.Thread(target=lambda: self.bot.run(), daemon=True)
             api_thread.start()
+            time.sleep(1)  # 等待连接建立
             
-            time.sleep(1)
-            last_trading_day = None
+            # 请求持仓数据
+            self.logger.info("请求持仓数据...")
+            self.bot.reqPositions()
+            time.sleep(1)  # 等待数据返回
+            
+            # 获取持仓信息
+            position_info = self.bot.positions.get(self.symbol, {})
+            self.current_position_size = position_info.get('position', 0)
+            self.logger.info(f"当前持仓: {self.current_position_size}")
             
             while True:
                 try:
                     now = datetime.now()
                     current_trading_day = now.date()
                     
-                    if last_trading_day != current_trading_day:
-                        if last_trading_day is not None:
+                    if self.last_trading_day != current_trading_day:
+                        if self.last_trading_day is not None:
                             self.log_daily_summary()
-                        last_trading_day = current_trading_day
+                        self.last_trading_day = current_trading_day
                         self.logger.info(f"\n=== 新交易日开始: {current_trading_day} ===")
                     
                     # 获取市场数据
